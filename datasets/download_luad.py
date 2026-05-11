@@ -256,9 +256,20 @@ def download_file(url: str, save_path: str) -> bool:
     이미 파일이 있으면 스킵. 실패 시 부분 파일 삭제.
     Returns True if success (including already-exists).
     """
+    # ── 이미 완료된 파일은 스킵 ──────────────────────────────────────────
     if os.path.exists(save_path):
         return True
+
+    # ── .part 임시파일 방식 ───────────────────────────────────────────────
+    # 다운로드 중에는 .part 파일에 쓰고, 완료 후 최종 파일명으로 rename.
+    # 세션이 끊기면 .part 파일이 남는데, 재실행 시 .part를 지우고 처음부터 다시 받음.
+    part_path = save_path + ".part"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # 이전 실행에서 남은 불완전 .part 파일 제거
+    if os.path.exists(part_path):
+        os.remove(part_path)
+
     try:
         resp = requests.get(url, stream=True, timeout=300)
         if resp.status_code == 401:
@@ -266,18 +277,20 @@ def download_file(url: str, save_path: str) -> bool:
             return False
         resp.raise_for_status()
         total = int(resp.headers.get("content-length", 0))
-        with open(save_path, "wb") as f, tqdm(
+        with open(part_path, "wb") as f, tqdm(
             total=total, unit="B", unit_scale=True,
             desc=os.path.basename(save_path)[:45], leave=False
         ) as bar:
             for chunk in resp.iter_content(1024 * 1024):
                 f.write(chunk)
                 bar.update(len(chunk))
+        # 완전히 받은 후에만 정식 파일명으로 rename
+        os.rename(part_path, save_path)
         return True
     except Exception as e:
         print(f"  [ERROR] {os.path.basename(save_path)}: {e}")
-        if os.path.exists(save_path):
-            os.remove(save_path)
+        if os.path.exists(part_path):
+            os.remove(part_path)
         return False
 
 
@@ -379,20 +392,125 @@ def main(args):
     print(f"{'='*60}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RETRY: 실패한 WSI만 재다운로드
+# ══════════════════════════════════════════════════════════════════════════════
+def retry_failed_wsi(failed_csv: str, mapping_csv: str, out_dir: str):
+    """
+    failed_cases_*.csv와 mapping.csv를 읽어서
+    wsi_ok=False인 케이스만 WSI 재다운로드 시도.
+
+    Args:
+        failed_csv  : 기존 failed_cases_*.csv 경로
+        mapping_csv : 기존 mapping.csv 경로 (file_id 참조용)
+        out_dir     : 다운로드 저장 루트 (기존과 동일하게 지정)
+    """
+    out_dir = Path(out_dir)
+
+    # ── 1. 실패 케이스 로드 ──────────────────────────────────────────────────
+    failed_cases = {}
+    with open(failed_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["wsi_ok"].strip().lower() == "false":
+                failed_cases[row["case_id"]] = row["reason"]
+
+    if not failed_cases:
+        print("[INFO] WSI 실패 케이스가 없습니다.")
+        return
+
+    print(f"[RETRY] WSI 재시도 대상: {len(failed_cases)}명")
+    for cid, reason in failed_cases.items():
+        print(f"  {cid}: {reason.strip()}")
+
+    # ── 2. mapping.csv에서 file_id 조회 ──────────────────────────────────────
+    wsi_info = {}
+    with open(mapping_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            cid = row["case_id"]
+            if cid in failed_cases and row.get("wsi_file_id"):
+                wsi_info[cid] = {
+                    "file_id":   row["wsi_file_id"],
+                    "file_name": row["wsi_file_name"],
+                }
+
+    no_info = [cid for cid in failed_cases if cid not in wsi_info]
+    if no_info:
+        print(f"\n[WARN] mapping.csv에 WSI 정보 없는 케이스: {no_info}")
+
+    if not wsi_info:
+        print("[ERROR] 재시도할 WSI 정보가 없습니다. mapping.csv를 확인하세요.")
+        return
+
+    # ── 3. 재다운로드 ─────────────────────────────────────────────────────────
+    print(f"\n=== WSI 재다운로드 ({len(wsi_info)}개) ===")
+    ok = fail = 0
+    still_failed = {}
+
+    for cid, info in tqdm(wsi_info.items(), desc="WSI 재시도", unit="case"):
+        url  = f"{GDC_DATA_ENDPOINT}/{info['file_id']}"
+        path = str(out_dir / "wsi" / cid / info["file_name"])
+
+        success = download_file(url, path)
+        if success:
+            print(f"  [OK] {cid}")
+            ok += 1
+        else:
+            print(f"  [FAIL] {cid}")
+            fail += 1
+            still_failed[cid] = {"rna_ok": True, "wsi_ok": False,
+                                  "reason": "재시도 후에도 WSI 다운로드 실패"}
+
+    # ── 4. 여전히 실패한 케이스 저장 ─────────────────────────────────────────
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if still_failed:
+        retry_fail_path = str(out_dir / f"failed_cases_retry_{ts}.csv")
+        save_failed_cases(still_failed, retry_fail_path)
+    else:
+        print("[INFO] 모든 재시도 성공! 실패 케이스 없음.")
+
+    print(f"\n{'='*60}")
+    print(f"  재시도 대상 : {len(wsi_info)}명")
+    print(f"  성공        : {ok}명")
+    print(f"  여전히 실패 : {fail}명")
+    print(f"{'='*60}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="TCGA-LUAD 전체 환자 RNA-seq + WSI(DX1) 다운로드"
     )
-    ap.add_argument("--out_dir",  default="./downloads",
+    ap.add_argument("--out_dir",      default="./downloads",
                     help="다운로드 저장 경로 (기본: ./downloads)")
-    ap.add_argument("--workflow", default="STAR - Counts",
+    ap.add_argument("--workflow",     default="STAR - Counts",
                     choices=["STAR - Counts", "STAR - FPKM", "STAR - FPKM-UQ"],
                     help="RNA-seq 워크플로우 타입")
-    ap.add_argument("--dry_run",  action="store_true",
+    ap.add_argument("--dry_run",      action="store_true",
                     help="매핑 테이블만 생성하고 다운로드 안 함")
-    ap.add_argument("--rna_only", action="store_true",
+    ap.add_argument("--rna_only",     action="store_true",
                     help="RNA-seq만 다운로드")
-    ap.add_argument("--wsi_only", action="store_true",
+    ap.add_argument("--wsi_only",     action="store_true",
                     help="WSI만 다운로드")
+
+    # ── retry 옵션 ──────────────────────────────────────────────────────────
+    ap.add_argument("--retry_failed", default=None,
+                    help="실패 케이스 재시도: failed_cases_*.csv 경로 지정")
+    ap.add_argument("--mapping",      default=None,
+                    help="retry 시 참조할 mapping.csv 경로 "
+                         "(미지정 시 --out_dir/mapping.csv 자동 탐색)")
     args = ap.parse_args()
-    main(args)
+
+    # ── retry 모드 ──────────────────────────────────────────────────────────
+    if args.retry_failed:
+        mapping_path = args.mapping or str(Path(args.out_dir) / "mapping.csv")
+        if not os.path.exists(args.retry_failed):
+            print(f"[ERROR] failed_cases 파일 없음: {args.retry_failed}")
+        elif not os.path.exists(mapping_path):
+            print(f"[ERROR] mapping.csv 없음: {mapping_path}")
+        else:
+            retry_failed_wsi(
+                failed_csv=args.retry_failed,
+                mapping_csv=mapping_path,
+                out_dir=args.out_dir,
+            )
+    else:
+        main(args)
