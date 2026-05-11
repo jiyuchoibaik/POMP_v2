@@ -151,6 +151,9 @@ class RNAPreprocessor:
             index="Term", columns="Name", values="NES"
         )["sample"]
 
+        # ── object → float 강제 변환 ──────────────────────────────────────
+        nes = pd.to_numeric(nes, errors="coerce").astype(np.float32)
+
         return nes
 
     def process(self, tsv_path: str, out_path: str) -> int:
@@ -169,6 +172,14 @@ class RNAPreprocessor:
 
         # 4. 정렬 (Hallmark 기준 알파벳순 고정)
         nes = nes.sort_index()
+
+        # NaN을 0으로 채우지 말고 에러로 올려서, 어떤 pathway가 문제인지 확인
+        if nes.isna().any():
+            nan_pathways = nes[nes.isna()].index.tolist()
+            raise ValueError(
+                f"NaN pathway {len(nan_pathways)}개 발생 — "
+                f"유전자 coverage 확인 필요: {nan_pathways[:5]}"
+         )
 
         # 5. 저장
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

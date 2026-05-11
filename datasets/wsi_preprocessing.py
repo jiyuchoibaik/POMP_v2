@@ -252,11 +252,17 @@ class WSIPreprocessor:
         WSI 1개 전처리.
         Returns: 저장된 패치 수
         """
-        slide     = openslide.OpenSlide(svs_path)
-        level     = self._get_target_level(slide)
-        slide_w, slide_h = slide.dimensions  # 원본 해상도
+        slide = openslide.OpenSlide(svs_path)
+    
+    # mag=40x만 처리, 나머지는 -1 반환
+        mag = slide.properties.get(openslide.PROPERTY_NAME_OBJECTIVE_POWER)
+        if mag is None or float(mag) != 40.0:
+            print(f"  [SKIP] mag={mag}: {Path(svs_path).name}")
+            slide.close()
+            return -1
 
-        # 조직 마스크
+        level    = self._get_target_level(slide)
+        slide_w, slide_h = slide.dimensions
         mask, (mask_h, mask_w) = self._get_tissue_mask(slide)
 
         patches = []
@@ -313,17 +319,6 @@ def run_batch(wsi_dir: str, out_dir: str,
               output_size: int = 256,
               tissue_thresh: float = 0.5,
               num_workers: int = 1):
-    """
-    wsi_dir 구조:
-        wsi_dir/
-            TCGA-XX-XXXX/
-                *.svs
-
-    out_dir 구조 (생성):
-        out_dir/
-            TCGA-XX-XXXX/
-                patches.pt   ← (N, 3, 256, 256) float32 tensor
-    """
     wsi_root = Path(wsi_dir)
     svs_files = sorted(wsi_root.rglob("*.svs"))
     print(f"[INFO] SVS 파일 수: {len(svs_files)}")
@@ -336,8 +331,6 @@ def run_batch(wsi_dir: str, out_dir: str,
     for svs_path in svs_files:
         case_id   = svs_path.parent.name
         case_out  = os.path.join(out_dir, case_id)
-
-        # 이미 처리된 경우 스킵
         if os.path.exists(os.path.join(case_out, "patches.pt")):
             continue
         tasks.append((str(svs_path), case_out,
@@ -345,8 +338,9 @@ def run_batch(wsi_dir: str, out_dir: str,
 
     print(f"[INFO] 처리 대상: {len(tasks)}개 (이미 완료: {len(svs_files)-len(tasks)}개 스킵)")
 
-    ok = fail = 0
-    failed_cases = []
+    ok = fail = skip = 0          # ← skip 추가
+    failed_cases  = []
+    skipped_cases = []            # ← 추가
 
     if num_workers > 1:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -358,6 +352,9 @@ def run_batch(wsi_dir: str, out_dir: str,
                     print(f"  [ERROR] {case_id}: {err}")
                     fail += 1
                     failed_cases.append(case_id)
+                elif n_patches == -1:                     # ← 추가
+                    skip += 1
+                    skipped_cases.append(case_id)
                 else:
                     print(f"  [OK] {case_id}: {n_patches}개 패치")
                     ok += 1
@@ -369,19 +366,27 @@ def run_batch(wsi_dir: str, out_dir: str,
                 print(f"  [ERROR] {case_id}: {err}")
                 fail += 1
                 failed_cases.append(case_id)
+            elif n_patches == -1:                         # ← 추가
+                skip += 1
+                skipped_cases.append(case_id)
             else:
                 print(f"  [OK] {case_id}: {n_patches}개 패치")
                 ok += 1
 
-    # 실패 케이스 저장
     if failed_cases:
         fail_path = os.path.join(out_dir, "wsi_failed_cases.txt")
         with open(fail_path, "w") as f:
             f.write("\n".join(failed_cases))
         print(f"\n[WARN] 실패 케이스 {fail}개 → {fail_path}")
 
+    if skipped_cases:                                     # ← 추가
+        skip_path = os.path.join(out_dir, "wsi_skipped_cases.txt")
+        with open(skip_path, "w") as f:
+            f.write("\n".join(skipped_cases))
+        print(f"[INFO] 스킵 케이스 {skip}개 → {skip_path}")
+
     print(f"\n{'='*50}")
-    print(f"  완료: {ok}개 | 실패: {fail}개")
+    print(f"  완료: {ok}개 | 스킵: {skip}개 | 실패: {fail}개")  # ← skip 추가
     print(f"  저장 위치: {out_dir}")
     print(f"{'='*50}")
 
