@@ -67,7 +67,7 @@ class RNAEncoder(nn.Module):
                 dim=hidden_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
-                drop=drop_rate,
+                proj_drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
             )

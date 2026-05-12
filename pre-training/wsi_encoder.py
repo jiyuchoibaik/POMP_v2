@@ -143,7 +143,7 @@ class PatTransformer(nn.Module):
                 dim=hidden_dim,
                 num_heads=num_heads,
                 mlp_ratio=mlp_ratio,
-                drop=drop_rate,
+                proj_drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
             )
@@ -209,6 +209,14 @@ class WSIEncoder(nn.Module):
         super().__init__()
 
         self.uni2 = UNI2Encoder(local_dir=uni2_local_dir)
+
+        # UNI2 완전 freeze
+        for p in self.uni2.parameters():
+            p.requires_grad = False
+
+        # 항상 eval 유지
+        self.uni2.eval()
+
         self.pat = PatTransformer(
             input_dim=1536,
             hidden_dim=pat_hidden_dim,
@@ -217,6 +225,18 @@ class WSIEncoder(nn.Module):
             num_heads=pat_num_heads,
             drop_rate=drop_rate,
         )
+
+    def train(self, mode: bool = True):
+        """
+        model.train() 호출 시에도
+        UNI2 backbone은 항상 eval 상태 유지.
+        """
+        super().train(mode)
+
+        # frozen backbone은 eval 유지
+        self.uni2.eval()
+
+        return self
 
     def forward(self, patches: torch.Tensor) -> tuple:
         """
@@ -228,9 +248,12 @@ class WSIEncoder(nn.Module):
         B, N, C, H, W = patches.shape
 
         # UNI2: 패치별 독립 처리 (freeze)
-        patches_flat = patches.reshape(B * N, C, H, W)     # (B*N, 3, 256, 256)
-        features = self.uni2(patches_flat)               # (B*N, 1536)
-        features = features.reshape(B, N, -1)               # (B, N, 1536)
+        patches_flat = patches.reshape(B * N, C, H, W)
+
+        with torch.no_grad():
+            features = self.uni2(patches_flat)           # (B*N, 1536)
+
+        features = features.reshape(B, N, -1)            # (B, N, 1536)
 
         # Pat-Transformer
         cls, tokens = self.pat(features)                 # (B,256), (B,N+1,512)

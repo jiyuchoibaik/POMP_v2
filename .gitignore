@@ -1,3 +1,6 @@
 downloads/
 preprocessed/
 uni2_features/
+pre-training/__pycache__/
+pre-training/assets/
+pre-training/checkpoints/

@@ -11,10 +11,11 @@ POMP 전체 모델 (수정본)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
-from .wsi_encoder import WSIEncoder
-from .rna_encoder import RNAEncoder
-from .multimodal_encoder import MultimodalEncoder
+from wsi_encoder import WSIEncoder
+from rna_encoder import RNAEncoder
+from multimodal_encoder import MultimodalEncoder
 
 
 class POMPModel(nn.Module):
@@ -63,11 +64,13 @@ class POMPModel(nn.Module):
             if hard_negative_start_epoch is not None
             else int(total_epochs * 0.3)
         )
+        self.itm_start_epoch = int(total_epochs * 0.2)  # ITC가 어느 정도 학습된 후 ITM을 학습시키기 위함
         self.current_epoch = 0   # 학습 루프에서 업데이트
 
         # learnable temperature
-        self.logit_scale = nn.Parameter(torch.ones([]) * (1 / temp).log())
-
+        self.logit_scale = nn.Parameter(
+            torch.ones([]) * math.log(1 / temp)
+        )
         # ── 단일 모달 인코더 ──────────────────────────────────────────────
         self.wsi_encoder = WSIEncoder(
             uni2_local_dir=uni2_local_dir,
@@ -267,7 +270,7 @@ class POMPModel(nn.Module):
         # ── ITC loss ──────────────────────────────────────────────────────
         loss_itc = self._itc_loss(z_wsi, z_rna)
 
-        # ── ITM + MOM loss ────────────────────────────────────────────────
+        # ── ITM + MOM loss ────────────────────────────────────────────────────
         loss_itm, loss_mom, fusion_wsi, fusion_rna = self._itm_mom_loss(
             wsi_tokens, rna_tokens,
             cls_p, cls_o,
@@ -276,18 +279,22 @@ class POMPModel(nn.Module):
             rna_mask=rna_mask,
         )
 
-        # ── 총 loss ───────────────────────────────────────────────────────
+        # ── 총 loss ───────────────────────────────────────────────────────────
+        # ITM은 itm_start_epoch 이후에만 반영
+        itm_weight = self.itm_weight if self.current_epoch >= self.itm_start_epoch else 0.0
+
         loss = (
             self.itc_weight * loss_itc +
-            self.itm_weight * loss_itm +
+            itm_weight      * loss_itm +
             self.mom_weight * loss_mom
         )
 
         return {
             "loss":     loss,
             "loss_itc": loss_itc,
-            "loss_itm": loss_itm,
+            "loss_itm": loss_itm,   # 로깅은 항상 출력 (weight=0이어도)
             "loss_mom": loss_mom,
+            "itm_active": self.current_epoch >= self.itm_start_epoch,  # 디버그용
         }
 
 
