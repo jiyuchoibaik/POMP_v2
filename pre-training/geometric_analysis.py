@@ -45,6 +45,56 @@ from pomp import POMPModel
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 패치 인덱스 사전 고정
+# ══════════════════════════════════════════════════════════════════════════════
+
+def precompute_patch_indices(
+    patient_ids: List[str],
+    wsi_dir: Path,
+    n_patches: int,
+    seed: int = 42,
+) -> Dict[str, torch.Tensor]:
+    """
+    모든 환자의 패치 샘플링 인덱스를 사전에 고정.
+
+    체크포인트마다 collect_embeddings를 반복 호출할 때
+    동일한 패치가 선택되도록 보장합니다.
+
+    파일시스템 순서 변동이나 체크포인트 간 RNG 상태 차이에 무관하게
+    재현 가능한 비교를 위해 모든 체크포인트 루프 진입 전 1회만 호출합니다.
+
+    Returns:
+        {patient_id: LongTensor(n_patches)}  – 각 환자의 패치 인덱스
+    """
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+
+    indices: Dict[str, torch.Tensor] = {}
+
+    for pid in patient_ids:
+        patches_path = wsi_dir / pid / "patches.pt"
+
+        try:
+            # shape 확인만을 위해 헤더 수준으로 로드
+            meta = torch.load(patches_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            meta = torch.load(patches_path, map_location="cpu")
+
+        N_avail = meta.shape[0]
+        del meta  # 메모리 즉시 해제
+
+        if N_avail >= n_patches:
+            idx = torch.randperm(N_avail, generator=rng)[:n_patches]
+        else:
+            # 패치 수 부족 시 over-sampling (중복 허용)
+            idx = torch.randint(0, N_avail, (n_patches,), generator=rng)
+
+        indices[pid] = idx  # LongTensor(n_patches)
+
+    return indices
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 기하학적 지표 함수
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -89,7 +139,7 @@ def modality_gap(Z_wsi: torch.Tensor, Z_rna: torch.Tensor) -> float:
     return (Z_wsi.float().mean(0) - Z_rna.float().mean(0)).norm().item()
 
 
-def uniformity(Z: torch.Tensor, t: float = 2.0) -> float:
+def uniformity(Z: torch.Tensor, t: float = 2.0, prenormalized: bool = False) -> float:
     """
     Intra-modal Uniformity (Wang & Isola, 2020)
 
@@ -97,13 +147,26 @@ def uniformity(Z: torch.Tensor, t: float = 2.0) -> float:
     범위: (-∞, 0]  →  낮을수록 더 균등하게 분포 (이상적).
 
     수식: log E[exp(-t · ||z_i - z_j||^2)]  (pairwise 평균)
-    계산 전 L2 정규화를 적용합니다.
+
+    정규화 정책:
+      - cls_p / cls_o (raw CLS): prenormalized=False → 내부에서 L2 정규화 후 계산
+      - z_wsi / z_rna (ITC 출력): prenormalized=True  → 이미 normalized이므로 skip
+
+    두 표현 간 uniformity를 비교하려면 동일한 hypersphere 위에 있어야 하므로,
+    cls 표현도 반드시 정규화 후 계산합니다.
+    prenormalized 플래그는 "불필요한 이중 normalize를 피하기 위한" 최적화이며,
+    의미론적 차이를 만들지 않습니다.
 
     Args:
-        Z: (N, d)
-        t: RBF 커널 bandwidth (기본값 2.0)
+        Z:            (N, d)
+        t:            RBF 커널 bandwidth (기본값 2.0)
+        prenormalized: True이면 이미 unit-norm → normalize skip
     """
-    Z = F.normalize(Z.float(), dim=-1)
+    if not prenormalized:
+        Z = F.normalize(Z.float(), dim=-1)
+    else:
+        Z = Z.float()  # dtype 통일만
+
     sq_pdist = torch.pdist(Z, p=2).pow(2)  # N*(N-1)/2 개 거리
     return sq_pdist.mul(-t).exp().mean().log().item()
 
@@ -162,10 +225,11 @@ def cross_modal_isotropy(Z_wsi: torch.Tensor, Z_rna: torch.Tensor) -> float:
     ev_wsi = _normalized_eigvals(Z_wsi)
     ev_rna = _normalized_eigvals(Z_rna)
 
-    # 차원이 다를 경우 짧은 쪽에 맞춤 (공통 차원만 비교)
+    # 차원이 다를 경우 큰 고유값(주축) 기준으로 맞춤
+    # eigvalsh는 오름차순이므로 [-min_d:] 로 상위 주축만 비교
     min_d = min(len(ev_wsi), len(ev_rna))
-    ev_wsi = ev_wsi[:min_d]
-    ev_rna = ev_rna[:min_d]
+    ev_wsi = ev_wsi[-min_d:]
+    ev_rna = ev_rna[-min_d:]
 
     corr = np.corrcoef(ev_wsi, ev_rna)[0, 1]
     return float(corr) if not np.isnan(corr) else 0.0
@@ -180,6 +244,10 @@ def compute_all_metrics(
     """
     4가지 기하학적 지표를 cls 표현과 z 표현 각각에 대해 계산.
 
+    uniformity 호출 시 prenormalized 플래그:
+      - cls_p / cls_o: raw CLS → False (함수 내부에서 정규화)
+      - z_wsi / z_rna: ITC 출력, 이미 unit-norm → True (정규화 skip)
+
     Returns:
         dict:
             cls/cka, cls/modality_gap,
@@ -191,12 +259,17 @@ def compute_all_metrics(
     """
     results: Dict[str, float] = {}
 
-    for tag, (W, R) in [("cls", (cls_p.cpu(), cls_o.cpu())),
-                         ("z",   (z_wsi.cpu(), z_rna.cpu()))]:
+    # (태그, WSI 표현, RNA 표현, 이미 정규화 여부)
+    configs = [
+        ("cls", cls_p.cpu(), cls_o.cpu(), False),  # raw CLS → normalize 필요
+        ("z",   z_wsi.cpu(), z_rna.cpu(), True),   # ITC 출력 → 이미 unit-norm
+    ]
+
+    for tag, W, R, is_prenorm in configs:
         results[f"{tag}/cka"]                  = linear_cka(W, R)
         results[f"{tag}/modality_gap"]         = modality_gap(W, R)
-        results[f"{tag}/uniformity_wsi"]       = uniformity(W)
-        results[f"{tag}/uniformity_rna"]       = uniformity(R)
+        results[f"{tag}/uniformity_wsi"]       = uniformity(W, prenormalized=is_prenorm)
+        results[f"{tag}/uniformity_rna"]       = uniformity(R, prenormalized=is_prenorm)
         results[f"{tag}/isotropy_wsi"]         = isotropy_score(W)
         results[f"{tag}/isotropy_rna"]         = isotropy_score(R)
         results[f"{tag}/cross_modal_isotropy"] = cross_modal_isotropy(W, R)
@@ -227,11 +300,13 @@ def load_patient(
     patient_id: str,
     wsi_dir: Path,
     rna_dir: Path,
-    n_patches: int,
-    rng: torch.Generator,
+    patch_idx: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     단일 환자 데이터 로드 및 패치 샘플링.
+
+    Args:
+        patch_idx: precompute_patch_indices 에서 사전 고정된 LongTensor(n_patches)
 
     Returns:
         patches:        (1, n_patches, 3, 256, 256)
@@ -245,19 +320,13 @@ def load_patient(
             weights_only=True,
         )
     except TypeError:
-        # 구버전 PyTorch: weights_only 미지원
         patches = torch.load(
             wsi_dir / patient_id / "patches.pt",
             map_location="cpu",
         )
 
-    N_avail = patches.shape[0]
-    if N_avail >= n_patches:
-        idx = torch.randperm(N_avail, generator=rng)[:n_patches]
-    else:
-        # 부족 시 over-sampling
-        idx = torch.randint(0, N_avail, (n_patches,), generator=rng)
-    patches = patches[idx].unsqueeze(0)  # (1, n_patches, 3, 256, 256)
+    # 사전 고정된 인덱스로 패치 선택 (체크포인트 간 동일 패치 보장)
+    patches = patches[patch_idx].unsqueeze(0)  # (1, n_patches, 3, 256, 256)
 
     # RNA pathway scores 로드
     try:
@@ -283,13 +352,17 @@ def collect_embeddings(
     patient_ids: List[str],
     wsi_dir: Path,
     rna_dir: Path,
-    n_patches: int,
+    patch_indices: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """
     모든 환자에 대해 4종 임베딩을 수집.
 
-    체크포인트마다 동일한 seed(42)를 사용해 재현성을 보장합니다.
+    패치 인덱스는 precompute_patch_indices()에서 사전 고정된 값을 사용합니다.
+    체크포인트가 달라도 동일한 패치를 참조하므로 공정한 비교가 보장됩니다.
+
+    Args:
+        patch_indices: {patient_id: LongTensor(n_patches)}
 
     Returns:
         {
@@ -300,8 +373,6 @@ def collect_embeddings(
         }
     """
     model.eval()
-    rng = torch.Generator()
-    rng.manual_seed(42)  # 체크포인트 간 비교를 위해 고정
 
     all_cls_p, all_cls_o, all_z_wsi, all_z_rna = [], [], [], []
 
@@ -310,7 +381,8 @@ def collect_embeddings(
             print(f"    [{i+1:3d}/{len(patient_ids)}] {pid}")
 
         patches, pathway_scores = load_patient(
-            pid, wsi_dir, rna_dir, n_patches, rng
+            pid, wsi_dir, rna_dir,
+            patch_idx=patch_indices[pid],   # 사전 고정 인덱스 사용
         )
         patches        = patches.to(device)
         pathway_scores = pathway_scores.to(device)
@@ -481,6 +553,16 @@ def main():
     print("\n[Step 1] 환자 목록 탐색 중...")
     patient_ids = find_patients(wsi_dir, rna_dir)
 
+    # ── 패치 인덱스 사전 고정 ─────────────────────────────────────────────
+    # 체크포인트 루프 진입 전 1회만 실행.
+    # 이후 모든 체크포인트가 동일한 인덱스를 참조하므로
+    # RNG 상태나 파일시스템 순서에 무관하게 공정한 비교가 보장됨.
+    print("\n[Step 2] 패치 인덱스 사전 고정 중 (seed=42)...")
+    patch_indices = precompute_patch_indices(
+        patient_ids, wsi_dir, n_patches=args.n_patches, seed=42
+    )
+    print(f"  완료: {len(patch_indices)}명 × {args.n_patches}패치")
+
     # ── 체크포인트별 분석 ─────────────────────────────────────────────────
     all_results: Dict[str, Dict[str, float]] = {}
     labels: List[str] = []
@@ -499,10 +581,12 @@ def main():
         print("  모델 로딩 중...")
         model = load_model(ckpt_path, args.uni2_dir, device)
 
-        # 임베딩 수집
+        # 임베딩 수집 (고정된 patch_indices 전달)
         print("  임베딩 추출 중...")
         embeds = collect_embeddings(
-            model, patient_ids, wsi_dir, rna_dir, args.n_patches, device
+            model, patient_ids, wsi_dir, rna_dir,
+            patch_indices=patch_indices,   # 사전 고정 인덱스
+            device=device,
         )
         del model
         if torch.cuda.is_available():
