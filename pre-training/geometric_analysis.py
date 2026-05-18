@@ -184,18 +184,31 @@ def isotropy_score(Z: torch.Tensor) -> float:
 
     λ_min/mean이 1/d에 가까울수록 등방적.
 
+    ---
+    개선된 등방성 지표: 고유값 분포의 Shannon Entropy 기반
+    모든 차원이 균등하게 분산을 나눠가지면 1.0, 
+    특정 주축에만 분산이 몰리면(차원 붕괴) 0에 수렴.
+
     Args:
         Z: (N, d)
     """
     Z = Z.float() - Z.float().mean(0)
-    C = (Z.T @ Z) / max(len(Z) - 1, 1)                  # (d, d) 공분산
-    eigvals = torch.linalg.eigvalsh(C).clamp(min=0)      # 오름차순
-
+    C = (Z.T @ Z) / max(len(Z) - 1, 1)
+    eigvals = torch.linalg.eigvalsh(C).clamp(min=1e-12) # numerical stability
+    
     total = eigvals.sum()
     if total < 1e-12:
         return 0.0
+        
+    # 고유값을 확률 분포로 변환 (스펙트럼 정규화)
+    p = eigvals / total
+    
+    # 정규화된 엔트로피 계산
+    entropy = -torch.sum(p * torch.log(p + 1e-12))
     d = eigvals.shape[0]
-    return (d * eigvals.min() / total).item()
+    max_entropy = np.log(d)
+    
+    return (entropy / max_entropy).item()
 
 
 def cross_modal_isotropy(Z_wsi: torch.Tensor, Z_rna: torch.Tensor) -> float:
