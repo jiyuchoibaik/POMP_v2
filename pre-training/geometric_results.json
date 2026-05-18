@@ -1,0 +1,53 @@
+{
+  "n_patients": 383,
+  "results": {
+    "Epoch 9 (초기)": {
+      "cls/cka": 0.014233372556958087,
+      "cls/modality_gap": 21.37811279296875,
+      "cls/uniformity_wsi": -0.00030259895720519125,
+      "cls/uniformity_rna": -0.007446587551385164,
+      "cls/isotropy_wsi": 0.0,
+      "cls/isotropy_rna": 0.0,
+      "cls/cross_modal_isotropy": 0.9079428861449614,
+      "z/cka": 0.012676939982191174,
+      "z/modality_gap": 1.3030683994293213,
+      "z/uniformity_wsi": -1.9431303371675313e-05,
+      "z/uniformity_rna": -0.001303568365983665,
+      "z/isotropy_wsi": 0.0,
+      "z/isotropy_rna": 0.0,
+      "z/cross_modal_isotropy": 0.9753913572561395
+    },
+    "Epoch 14 (best)": {
+      "cls/cka": 0.019729863539415683,
+      "cls/modality_gap": 21.36540985107422,
+      "cls/uniformity_wsi": -0.00022646368597634137,
+      "cls/uniformity_rna": -0.008701401762664318,
+      "cls/isotropy_wsi": 0.0,
+      "cls/isotropy_rna": 0.0,
+      "cls/cross_modal_isotropy": 0.8503649362988539,
+      "z/cka": 0.021819169036689585,
+      "z/modality_gap": 1.2391533851623535,
+      "z/uniformity_wsi": -1.025205165205989e-05,
+      "z/uniformity_rna": -0.0011794964084401727,
+      "z/isotropy_wsi": 0.0,
+      "z/isotropy_rna": 0.0,
+      "z/cross_modal_isotropy": 0.9286719476006504
+    },
+    "Epoch 199 (최종)": {
+      "cls/cka": 0.8111846761955136,
+      "cls/modality_gap": 14.440634727478027,
+      "cls/uniformity_wsi": -0.9848315715789795,
+      "cls/uniformity_rna": -1.0483729839324951,
+      "cls/isotropy_wsi": 0.0,
+      "cls/isotropy_rna": 0.0,
+      "cls/cross_modal_isotropy": 0.999959117633799,
+      "z/cka": 0.777344478728879,
+      "z/modality_gap": 0.32530704140663147,
+      "z/uniformity_wsi": -1.2008649110794067,
+      "z/uniformity_rna": -1.2067582607269287,
+      "z/isotropy_wsi": 0.0,
+      "z/isotropy_rna": 0.0,
+      "z/cross_modal_isotropy": 0.9986935703762068
+    }
+  }
+}

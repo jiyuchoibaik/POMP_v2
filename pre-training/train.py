@@ -9,53 +9,95 @@ POMP 사전학습 루프
   - Hard negative curriculum (pomp.py에서 관리)
   - WandB 로깅 (선택)
   - 체크포인트 저장/재개
-
-사용법:
-  # 기본 학습
-  python train.py \
-      --wsi_dir ../datasets/preprocessed/wsi \
-      --rna_dir ../datasets/preprocessed/rna \
-      --out_dir ./checkpoints \
-      --epochs 100 \
-      --batch_size 8
-
-  # 체크포인트 재개
-  python train.py ... --resume ./checkpoints/last.pt
-
-  # WandB 로깅
-  python train.py ... --use_wandb --wandb_project pomp_pretrain
+  - 파일 로깅 (train_YYYYMMDD_HHMMSS.log)
+  - CSV 메트릭 저장 (metrics.csv)
 """
 
 import os
 import sys
+import csv
 import math
 import json
+import logging
 import argparse
 import time
 from pathlib import Path
 from datetime import datetime
-import torch.nn.functional as F
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 
-# 상위 폴더에서 import
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset_loader import build_loaders
 from pomp import POMPModel
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Logger
+# ══════════════════════════════════════════════════════════════════════════════
+def setup_logger(out_dir: str) -> logging.Logger:
+    """파일 + 콘솔 동시 로깅"""
+    os.makedirs(out_dir, exist_ok=True)
+
+    log_path = os.path.join(
+        out_dir,
+        f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+
+    logger = logging.getLogger("POMP")
+    logger.setLevel(logging.INFO)
+
+    # 이미 핸들러가 있으면 제거 (resume 시 중복 방지)
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    logger.info(f"로그 저장: {log_path}")
+    return logger
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CSV 메트릭 저장
+# ══════════════════════════════════════════════════════════════════════════════
+CSV_FIELDS = [
+    "epoch",
+    "train_loss", "train_itc", "train_itm", "train_mom",
+    "val_loss",   "val_itc",   "val_itm",   "val_mom",
+    "lr", "itm_active",
+]
+
+def save_metrics_csv(row: dict, out_dir: str):
+    csv_path = os.path.join(out_dir, "metrics.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LR Scheduler (cosine + warmup)
 # ══════════════════════════════════════════════════════════════════════════════
-def build_scheduler(optimizer, warmup_epochs: int, total_epochs: int, n_iter_per_ep: int):
-    """
-    step 단위 cosine LR + linear warmup.
-    warmup: 0 → lr
-    cosine: lr → lr_min (lr * 0.01)
-    """
-    warmup_steps  = warmup_epochs * n_iter_per_ep
-    total_steps   = total_epochs  * n_iter_per_ep
+def build_scheduler(optimizer, warmup_epochs, total_epochs, n_iter_per_ep):
+    warmup_steps = warmup_epochs * n_iter_per_ep
+    total_steps  = total_epochs  * n_iter_per_ep
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -71,19 +113,18 @@ def build_scheduler(optimizer, warmup_epochs: int, total_epochs: int, n_iter_per
 # ══════════════════════════════════════════════════════════════════════════════
 def save_checkpoint(state: dict, out_dir: str, name: str):
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, name)
-    torch.save(state, path)
+    torch.save(state, os.path.join(out_dir, name))
 
 
-def load_checkpoint(path: str, model, optimizer, scheduler, scaler):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+def load_checkpoint(path, model, optimizer, scheduler, scaler, logger):
+    ckpt        = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
     start_epoch = ckpt["epoch"] + 1
     best_val    = ckpt.get("best_val_loss", float("inf"))
-    print(f"[Checkpoint] {path} 로드 완료 → epoch {start_epoch}부터 재개")
+    logger.info(f"[Checkpoint] {path} 로드 → epoch {start_epoch}부터 재개")
     return start_epoch, best_val
 
 
@@ -117,60 +158,25 @@ class MetricTracker:
 # 단일 epoch 학습
 # ══════════════════════════════════════════════════════════════════════════════
 def train_one_epoch(
-    model:      POMPModel,
-    loader:     torch.utils.data.DataLoader,
-    optimizer:  torch.optim.Optimizer,
-    scheduler,
-    scaler:     GradScaler,
-    device:     torch.device,
-    epoch:      int,
-    args,
+    model, loader, optimizer, scheduler, scaler,
+    device, epoch, args, logger,
 ) -> dict:
 
     model.train()
-    model.set_epoch(epoch)      # hard negative curriculum 업데이트
+    model.set_epoch(epoch)
 
-    tracker  = MetricTracker()
-    n_steps  = len(loader)
-    t_start  = time.time()
+    tracker = MetricTracker()
+    n_steps = len(loader)
+    t_start = time.time()
 
     for step, batch in enumerate(loader):
         patches        = batch["patches"].to(device, non_blocking=True)
         pathway_scores = batch["pathway_scores"].to(device, non_blocking=True)
 
-        with autocast(enabled=args.amp):
-            out = model(patches, pathway_scores, mode="pretrain")
+        with torch.amp.autocast('cuda', enabled=args.amp):
+            out  = model(patches, pathway_scores, mode="pretrain")
             loss = out["loss"]
 
-        # ── 임시 디버그 (step==0에만) ──────────────────────────────
-        if step == 0 and epoch == 1:
-            with torch.no_grad():
-                cls_p, wsi_tokens = model.wsi_encoder(patches)
-                cls_o, rna_tokens = model.rna_encoder(pathway_scores)
-
-                out_pos = model.mm_encoder(
-                    wsi_tokens, rna_tokens, cls_p, cls_o
-                )
-                print(f"\n[DEBUG] itm_logits (pos):\n{out_pos['itm_logits']}")
-                print(f"[DEBUG] H_wsi_cls norm: {out_pos['H_wsi_cls'].norm(dim=-1)}")
-                print(f"[DEBUG] H_rna_cls norm: {out_pos['H_rna_cls'].norm(dim=-1)}")
-
-                neg_rna   = rna_tokens[torch.randperm(rna_tokens.shape[0])]
-                neg_cls_o = cls_o[torch.randperm(cls_o.shape[0])]
-                out_neg   = model.mm_encoder(
-                    wsi_tokens, neg_rna, cls_p, neg_cls_o
-                )
-                print(f"[DEBUG] itm_logits (neg):\n{out_neg['itm_logits']}")
-
-                B = patches.shape[0]
-                logits = torch.cat([out_pos['itm_logits'], out_neg['itm_logits']], dim=0)
-                labels = torch.cat([
-                    torch.ones(B, dtype=torch.long),
-                    torch.zeros(B, dtype=torch.long),
-                ]).to(device)
-                print(f"[DEBUG] ITM loss 직접: {F.cross_entropy(logits, labels).item():.4f}")
-        # ── 디버그 끝 ─────────────────────────────────────────────
-        # gradient accumulation
         loss = loss / args.grad_accum
         scaler.scale(loss).backward()
 
@@ -178,7 +184,6 @@ def train_one_epoch(
             (step + 1) % args.grad_accum == 0
             or (step + 1) == n_steps
         )
-
         if is_update_step:
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -195,13 +200,12 @@ def train_one_epoch(
             "loss_mom": out["loss_mom"].item(),
         }, n=B)
 
-        # 진행 출력
         if step % args.log_interval == 0:
-            lr  = scheduler.get_last_lr()[0]
-            avg = tracker.avg()
+            lr      = scheduler.get_last_lr()[0]
+            avg     = tracker.avg()
             elapsed = time.time() - t_start
-            eta = elapsed / (step + 1) * (n_steps - step - 1)
-            print(
+            eta     = elapsed / (step + 1) * (n_steps - step - 1)
+            logger.info(
                 f"  Epoch [{epoch:3d}] [{step:4d}/{n_steps}]  "
                 f"loss={avg['loss']:.4f}  "
                 f"itc={avg['loss_itc']:.4f}  "
@@ -217,13 +221,7 @@ def train_one_epoch(
 # Validation
 # ══════════════════════════════════════════════════════════════════════════════
 @torch.no_grad()
-def validate(
-    model:  POMPModel,
-    loader: torch.utils.data.DataLoader,
-    device: torch.device,
-    args,
-) -> dict:
-
+def validate(model, loader, device, args) -> dict:
     model.eval()
     tracker = MetricTracker()
 
@@ -249,12 +247,13 @@ def validate(
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 def main(args):
-    # ── 재현성 ────────────────────────────────────────────────────────────
     torch.manual_seed(args.seed)
-
-    # ── 디바이스 ──────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] {device}")
+
+    # ── Logger ────────────────────────────────────────────────────────────
+    logger = setup_logger(args.out_dir)
+    logger.info(f"Device: {device}")
+    logger.info(f"Args:\n{json.dumps(vars(args), indent=2)}")
 
     # ── WandB ─────────────────────────────────────────────────────────────
     if args.use_wandb:
@@ -286,6 +285,7 @@ def main(args):
         uni2_local_dir=args.uni2_dir,
         total_epochs=args.epochs,
         hard_negative_start_epoch=args.hard_neg_start,
+        queue_size=args.queue_size,
         itc_weight=args.itc_weight,
         itm_weight=args.itm_weight,
         mom_weight=args.mom_weight,
@@ -293,10 +293,9 @@ def main(args):
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[Model] 학습 파라미터: {n_params:,}개")
+    logger.info(f"학습 파라미터: {n_params:,}개")
 
     # ── Optimizer ─────────────────────────────────────────────────────────
-    # UNI2는 freeze이므로 학습 파라미터만 optimizer에 전달
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
@@ -316,11 +315,11 @@ def main(args):
     scaler = GradScaler(enabled=args.amp)
 
     # ── 체크포인트 재개 ───────────────────────────────────────────────────
-    start_epoch  = 0
-    best_val     = float("inf")
+    start_epoch = 0
+    best_val    = float("inf")
     if args.resume and os.path.exists(args.resume):
         start_epoch, best_val = load_checkpoint(
-            args.resume, model, optimizer, scheduler, scaler
+            args.resume, model, optimizer, scheduler, scaler, logger
         )
 
     # ── 설정 저장 ─────────────────────────────────────────────────────────
@@ -328,28 +327,29 @@ def main(args):
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  사전학습 시작: {args.epochs}epochs  batch={args.batch_size}")
+    logger.info(f"  ITM start epoch:          {model.itm_start_epoch}")
+    logger.info(f"  Hard negative start epoch:{model.hard_negative_start_epoch}")
+    logger.info(f"  Queue size:               {args.queue_size}")
+    logger.info(f"{'='*60}\n")
+
     # ══════════════════════════════════════════════════════════════════════
     # 학습 루프
     # ══════════════════════════════════════════════════════════════════════
-    print(f"\n{'='*60}")
-    print(f"  사전학습 시작: {args.epochs}epochs  batch={args.batch_size}")
-    print(f"  hard negative start epoch: {model.hard_negative_start_epoch}")
-    print(f"{'='*60}\n")
-
     for epoch in range(start_epoch, args.epochs):
         ep_start = time.time()
 
-        # ── Train ──────────────────────────────────────────────────────────
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler,
-            device, epoch, args,
+            device, epoch, args, logger,
         )
-
-        # ── Validation ────────────────────────────────────────────────────
         val_metrics = validate(model, val_loader, device, args)
 
-        ep_time = time.time() - ep_start
-        print(
+        ep_time    = time.time() - ep_start
+        itm_active = epoch >= model.itm_start_epoch
+
+        logger.info(
             f"\nEpoch [{epoch:3d}/{args.epochs}]  "
             f"train_loss={train_metrics['loss']:.4f}  "
             f"val_loss={val_metrics['loss']:.4f}  "
@@ -357,11 +357,26 @@ def main(args):
             f"  train → itc={train_metrics['loss_itc']:.4f}  "
             f"itm={train_metrics['loss_itm']:.4f}  "
             f"mom={train_metrics['loss_mom']:.4f}  "
-            f"[ITM {'ON' if epoch >= model.itm_start_epoch else 'OFF'}]\n"  # ← 추가
+            f"[ITM {'ON' if itm_active else 'OFF'}]\n"
             f"  val   → itc={val_metrics['loss_itc']:.4f}  "
             f"itm={val_metrics['loss_itm']:.4f}  "
             f"mom={val_metrics['loss_mom']:.4f}"
         )
+
+        # ── CSV 저장 ──────────────────────────────────────────────────────
+        save_metrics_csv({
+            "epoch":      epoch,
+            "train_loss": round(train_metrics["loss"],     4),
+            "train_itc":  round(train_metrics["loss_itc"], 4),
+            "train_itm":  round(train_metrics["loss_itm"], 4),
+            "train_mom":  round(train_metrics["loss_mom"], 4),
+            "val_loss":   round(val_metrics["loss"],       4),
+            "val_itc":    round(val_metrics["loss_itc"],   4),
+            "val_itm":    round(val_metrics["loss_itm"],   4),
+            "val_mom":    round(val_metrics["loss_mom"],   4),
+            "lr":         round(scheduler.get_last_lr()[0], 6),
+            "itm_active": int(itm_active),
+        }, args.out_dir)
 
         # ── WandB 로깅 ────────────────────────────────────────────────────
         if args.use_wandb:
@@ -377,6 +392,7 @@ def main(args):
                 "val/loss_itm":   val_metrics["loss_itm"],
                 "val/loss_mom":   val_metrics["loss_mom"],
                 "lr":             scheduler.get_last_lr()[0],
+                "itm_active":     int(itm_active),
             })
 
         # ── 체크포인트 저장 ────────────────────────────────────────────────
@@ -391,25 +407,21 @@ def main(args):
             "best_val_loss": best_val,
             "args":          vars(args),
         }
-
-        # last.pt: 항상 저장
         save_checkpoint(ckpt, args.out_dir, "last.pt")
 
-        # best.pt: val_loss 개선 시
         val_loss = val_metrics["loss"]
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint(ckpt, args.out_dir, "best.pt")
-            print(f"  ★ best val_loss 갱신: {best_val:.4f}")
+            logger.info(f"  ★ best val_loss 갱신: {best_val:.4f}")
 
-        # 주기적 저장
         if (epoch + 1) % args.save_interval == 0:
             save_checkpoint(ckpt, args.out_dir, f"epoch_{epoch:03d}.pt")
 
-        print()
+        logger.info("")
 
-    print(f"\n사전학습 완료! best val_loss: {best_val:.4f}")
-    print(f"체크포인트 위치: {args.out_dir}")
+    logger.info(f"사전학습 완료! best val_loss: {best_val:.4f}")
+    logger.info(f"체크포인트 위치: {args.out_dir}")
 
     if args.use_wandb:
         import wandb
@@ -423,57 +435,45 @@ def parse_args():
     ap = argparse.ArgumentParser(description="POMP 사전학습")
 
     # 데이터
-    ap.add_argument("--wsi_dir",     required=True,
-                    help="preprocessed/wsi 경로")
-    ap.add_argument("--rna_dir",     required=True,
-                    help="preprocessed/rna 경로")
-    ap.add_argument("--uni2_dir",    default="./assets/uni2",
-                    help="UNI2-h 가중치 디렉토리")
-    ap.add_argument("--n_patches",   type=int, default=100,
-                    help="환자당 샘플링 패치 수 (default: 100)")
-    ap.add_argument("--val_ratio",   type=float, default=0.1,
-                    help="validation 비율 (default: 0.1)")
+    ap.add_argument("--wsi_dir",      required=True)
+    ap.add_argument("--rna_dir",      required=True)
+    ap.add_argument("--uni2_dir",     default="./assets/uni2")
+    ap.add_argument("--n_patches",    type=int,   default=100)
+    ap.add_argument("--val_ratio",    type=float, default=0.1)
 
     # 학습
-    ap.add_argument("--out_dir",     default="./checkpoints",
-                    help="체크포인트 저장 경로")
-    ap.add_argument("--epochs",      type=int, default=100)
-    ap.add_argument("--batch_size",  type=int, default=8)
-    ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--lr",          type=float, default=5e-4)
-    ap.add_argument("--weight_decay",type=float, default=1e-2)
-    ap.add_argument("--warmup_epochs",type=int, default=5)
-    ap.add_argument("--clip_grad",   type=float, default=1.0)
-    ap.add_argument("--grad_accum",  type=int, default=1,
-                    help="gradient accumulation steps")
-    ap.add_argument("--seed",        type=int, default=42)
+    ap.add_argument("--out_dir",      default="./checkpoints")
+    ap.add_argument("--epochs",       type=int,   default=200)
+    ap.add_argument("--batch_size",   type=int,   default=16)
+    ap.add_argument("--num_workers",  type=int,   default=4)
+    ap.add_argument("--lr",           type=float, default=5e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-2)
+    ap.add_argument("--warmup_epochs",type=int,   default=5)
+    ap.add_argument("--clip_grad",    type=float, default=1.0)
+    ap.add_argument("--grad_accum",   type=int,   default=1)
+    ap.add_argument("--seed",         type=int,   default=42)
 
-    # Loss 가중치
-    ap.add_argument("--itc_weight",  type=float, default=1.0)
-    ap.add_argument("--itm_weight",  type=float, default=2.0)
-    ap.add_argument("--mom_weight",  type=float, default=1.0)
-    ap.add_argument("--temp",        type=float, default=0.07,
-                    help="ITC temperature")
+    # Loss
+    ap.add_argument("--itc_weight",   type=float, default=1.0)
+    ap.add_argument("--itm_weight",   type=float, default=2.0)
+    ap.add_argument("--mom_weight",   type=float, default=1.0)
+    ap.add_argument("--temp",         type=float, default=0.07)
+    ap.add_argument("--queue_size",   type=int,   default=256)
 
-    # Hard negative curriculum
-    ap.add_argument("--hard_neg_start", type=int, default=None,
-                    help="hard negative 시작 epoch (None이면 epoch*0.3)")
+    # Curriculum
+    ap.add_argument("--hard_neg_start", type=int, default=None)
 
     # 기타
-    ap.add_argument("--amp",         action="store_true", default=True,
-                    help="Mixed precision (default: True)")
-    ap.add_argument("--no_amp",      action="store_false", dest="amp")
-    ap.add_argument("--resume",      default=None,
-                    help="재개할 체크포인트 경로")
-    ap.add_argument("--log_interval",type=int, default=10,
-                    help="로그 출력 간격 (step 단위)")
-    ap.add_argument("--save_interval",type=int, default=10,
-                    help="주기적 체크포인트 저장 간격 (epoch 단위)")
+    ap.add_argument("--amp",          action="store_true", default=True)
+    ap.add_argument("--no_amp",       action="store_false", dest="amp")
+    ap.add_argument("--resume",       default=None)
+    ap.add_argument("--log_interval", type=int, default=10)
+    ap.add_argument("--save_interval",type=int, default=10)
 
     # WandB
-    ap.add_argument("--use_wandb",   action="store_true")
-    ap.add_argument("--wandb_project", default="pomp_pretrain")
-    ap.add_argument("--wandb_run",   default=None)
+    ap.add_argument("--use_wandb",    action="store_true")
+    ap.add_argument("--wandb_project",default="pomp_pretrain")
+    ap.add_argument("--wandb_run",    default=None)
 
     return ap.parse_args()
 
